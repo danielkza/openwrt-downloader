@@ -18,13 +18,17 @@ try:
 except ImportError:
     from urlparse import urljoin, urlsplit
 
-import scrapy.signals
 from scrapy import Field, Item, Request, Spider
+from scrapy import logformatter
 from scrapy.crawler import CrawlerProcess
 from scrapy.exceptions import DropItem
 from scrapy.pipelines.files import FileException, FilesPipeline
 from scrapy.settings import Settings
 from scrapy.utils.request import referer_str
+import twisted.web.http as http
+from twisted.internet import defer
+from twisted.python.failure import Failure
+
 
 OPENWRT_DEFAULT_BASE_URL = 'https://downloads.openwrt.org/releases'
 
@@ -62,17 +66,45 @@ class OpenWrtSpider(Spider):
 
     name = 'openwrt'
 
-    def __init__(self, base_url, version=None, device=None, target=None,
-                 image_type=None, **kwargs):
-        self.base_url = base_url + '/'
-        self.version = version
-        self.device = device
-        self.target = target
-        self.image_type = image_type
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        return super(OpenWrtSpider, cls).from_crawler(
+            crawler, *args, settings=crawler.settings, **kwargs)
 
+    def __init__(self, **kwargs):
         super(OpenWrtSpider, self).__init__(**kwargs)
 
+        settings = kwargs['settings']
+        self.base_url = settings['OPENWRT_BASE_URL'] + '/'
+        self.version = settings.get('OPENWRT_VERSION')
+        self.device = settings.get('OPENWRT_DEVICE')
+        self.target = settings.get('OPENWRT_TARGET')
+        self.image_type = settings.get('OPENWRT_IMAGE_TYPE')
+        self.index_file = settings.get('OPENWRT_INDEX_FILE')
+
+    def load_index(self, response):
+        assert self.index_file
+
+        if self.index_file == '-':
+            f = sys.stdin
+        else:
+            f = open(self.index_file, 'rb')
+
+        try:
+            for item in json.load(f):
+                yield Image(**item)
+        finally:
+            self.index_file = None
+            if f is not sys.stdin:
+                f.close()
+
     def start_requests(self):
+        if self.index_file:
+            # Make a simple head request to the base URL, but ignore the result
+            # and just generate the cached index images as a response.
+            yield Request(self.base_url, self.load_index)
+            return
+
         if self.version:
             targets_url = '{}{}/targets/{}'.format(
                 self.base_url, self.version, self.target or '')
@@ -150,36 +182,8 @@ class OpenWrtSpider(Spider):
             if not image:
                 continue
 
-            if self.device and image['device'] != self.device \
-                    or self.image_type and image['type'] != self.image_type:
-                continue
-
             image['sha256'] = csum
             yield image
-
-
-class PreloadedSpider(Spider):
-    name = 'openwrt-preloaded'
-
-    @classmethod
-    def from_crawler(cls, crawler, *args, **kwargs):
-        from_crawler = super(PreloadedSpider, cls).from_crawler
-        spider = from_crawler(crawler, *args, **kwargs)
-        crawler.signals.connect(spider.idle, signal=scrapy.signals.spider_idle)
-        return spider
-
-    def __init__(self, items, **kwargs):
-        self.items = items
-        super(PreloadedSpider, self).__init__(**kwargs)
-
-    def idle(self):
-        if self.items:
-            itemproc = self.crawler.engine.scraper.itemproc
-            for item in self.items:
-                logger.debug('Manually processing item: %s', item)
-                itemproc.process_item(item, self)
-
-            self.items = None
 
 
 def sha256sum(buf):
@@ -193,12 +197,102 @@ def sha256sum(buf):
 
 
 class OpenWrtDownloaderPipeline(FilesPipeline):
+    def __init__(self, *args, **kwargs):
+        super(OpenWrtDownloaderPipeline, self).__init__(*args, **kwargs)
+
+        settings = kwargs['settings']
+        self.version = settings.get('OPENWRT_VERSION')
+        self.device = settings.get('OPENWRT_DEVICE')
+        self.target = settings.get('OPENWRT_TARGET')
+        self.image_type = settings.get('OPENWRT_IMAGE_TYPE')
+
+    def process_item(self, item, spider):
+        if not isinstance(item, Image):
+            raise DropItem("Not an OpenWRT image")
+
+        if self.version and item['version'] != self.version \
+                or self.target and item['target'] != self.target \
+                or self.device and item['device'] != self.device \
+                or self.image_type and item['type'] != self.image_type:
+            raise DropItem("Rejected by OpenWRT filters")
+
+        process_item = super(OpenWrtDownloaderPipeline, self).process_item
+        return process_item(item, spider)
+
     def get_media_requests(self, item, info):
-        meta = {'sha256': item['sha256']}
+        meta = {
+            'sha256': item['sha256'],
+            'openwrt_version': item['version'],
+            'openwrt_target': item['target']
+        }
         yield Request(item['url'], meta=meta)
 
     def file_path(self, request, response=None, info=None):
-        return request.url.split('/')[-1]
+        version = request.meta['openwrt_version']
+        target = request.meta['openwrt_target']
+        fname = request.url.split('/')[-1]
+        return '/'.join([version, target, fname])
+
+    def _check_media_fresh(self, response):
+        if response.status == 304:
+            return True
+        elif response.status == 200:
+            # The media stores don't set the mtime of the stored files to the
+            # value of the Last-Modified headers, and some web servers (e.g
+            # nginx) only return 304s if the time matches exactly. Check the
+            # time manually when we see a 200 to work around that.
+            try:
+                request_time = response.meta['media_last_modified']
+                response_time = http.stringToDatetime(
+                    response.headers['Last-Modified'])
+            except KeyError:
+                return False
+
+            return request_time >= response_time
+
+    def _handle_download_head(self, response, request, info):
+        if isinstance(response, Failure):
+            logger.warn('Conditional HTTP request %s failed: %s', request,
+                        response)
+            return None
+
+        if self._check_media_fresh(response):
+            logger.debug('Current copy is up-to-date, skipping download: %s',
+                         request.url)
+            return response.meta['media_stat']
+
+        return None
+
+    def _check_download_condition(self, request, info, media_stat,
+                                  last_modified):
+        head_request = request.replace(method='HEAD')
+        head_request.meta['media_stat'] = media_stat
+        head_request.meta['media_last_modified'] = last_modified
+        head_request.headers['If-Modified-Since'] = \
+            http.datetimeToString(last_modified)
+
+        dfd = self.crawler.engine.download(head_request, info.spider)
+        dfd.addBoth(self._handle_download_head, head_request, info)
+        return dfd
+
+    def _handle_download_stat(self, result, request, info, path):
+        if not result:
+            return  # returning None force download
+
+        last_modified = result.get('last_modified', None)
+        if not last_modified:
+            return  # returning None force download
+
+        checksum = result.get('checksum', None)
+        media_stat = {'url': request.url, 'path': path, 'checksum': checksum}
+        return self._check_download_condition(request, info, media_stat,
+                                              last_modified)
+
+    def media_to_download(self, request, info):
+        path = self.file_path(request, info=info)
+        dfd = defer.maybeDeferred(self.store.stat_file, path, info)
+        dfd.addBoth(self._handle_download_stat, request, info, path)
+        return dfd
 
     def file_downloaded(self, response, request, info):
         expected_csum = request.meta.get('sha256')
@@ -230,31 +324,32 @@ class OpenWrtDownloaderPipeline(FilesPipeline):
         return item
 
 
-def load_index(path):
-    if path == '-':
-        f = sys.stdin
-    else:
-        f = open(path, 'rb')
-
-    try:
-        data = json.load(f)
-        return [Image(**item) for item in data]
-    finally:
-        if f is not sys.stdin:
-            f.close()
+class PoliteLogFormatter(logformatter.LogFormatter):
+    def dropped(self, item, exception, response, spider):
+        return {
+            'level': logging.DEBUG,
+            'msg': logformatter.DROPPEDMSG,
+            'args': {
+                'exception': exception,
+                'item': item,
+            }
+        }
 
 
 def crawl(args):
-    settings = {}
-    index_items = None
+    settings = dict(
+        OPENWRT_BASE_URL=args.base_url,
+        OPENWRT_VERSION=args.openwrt_version,
+        OPENWRT_TARGET=args.target,
+        OPENWRT_DEVICE=args.device,
+        OPENWRT_IMAGE_TYPE=args.image_type,
+        LOG_FORMATTER=__name__ + '.PoliteLogFormatter'
+    )
     tmp_fd = tmp_path = None
 
     if args.command == 'download':
-        if args.index_file:
-            index_items = list(load_index(args.index_file))
-            logger.debug('Loaded index entries: %s', index_items)
-
         settings.update(
+            OPENWRT_INDEX_FILE=args.index_file,
             ITEM_PIPELINES={__name__ + '.OpenWrtDownloaderPipeline': 1},
             FILES_STORE=os.path.abspath(args.download_dir),
             MEDIA_ALLOW_REDIRECTS=True)
@@ -274,15 +369,7 @@ def crawl(args):
         process = CrawlerProcess(settings=Settings(values=settings),
                                  install_root_handler=False)
         logging.getLogger('scrapy').setLevel(logging.INFO)
-
-        if index_items:
-            process.crawl(PreloadedSpider, items=index_items)
-        else:
-            process.crawl(
-                OpenWrtSpider,
-                base_url=args.base_url, version=args.openwrt_version,
-                target=args.target, device=args.device,
-                image_type=args.image_type)
+        process.crawl(OpenWrtSpider)
         process.start()
 
         if tmp_path:
@@ -323,7 +410,7 @@ def main():
         '--base-url', default=OPENWRT_DEFAULT_BASE_URL,
         help='Base URL to crawl, without a trailing slash')
     argp.add_argument(
-        '-i', '--index-file', required=True,
+        '-i', '--index-file', default=None,
         help='File to load/store indexing results. Use "-" for stdout.')
 
     cmds = argp.add_subparsers()
