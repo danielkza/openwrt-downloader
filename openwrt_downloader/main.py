@@ -88,9 +88,7 @@ class OpenWrtSpider(Spider):
         settings = kwargs['settings']
         self.base_url = settings['OPENWRT_BASE_URL'] + '/'
         self.version = settings.get('OPENWRT_VERSION')
-        self.device = settings.get('OPENWRT_DEVICE')
         self.target = settings.get('OPENWRT_TARGET')
-        self.image_type = settings.get('OPENWRT_IMAGE_TYPE')
         self.index_file = settings.get('OPENWRT_INDEX_FILE')
 
     def load_index(self, response):
@@ -225,7 +223,7 @@ class OpenWrtImageSelectorPipeline(object):
             raise DropItem("Not an OpenWRT image")
 
         if self.version and item['version'] != self.version \
-                or self.target and item['target'] != self.target \
+                or self.target and not item['target'].startswith(self.target) \
                 or self.device and item['device'] != self.device \
                 or self.image_type and item['type'] != self.image_type:
             raise DropItem("Rejected by OpenWRT filters")
