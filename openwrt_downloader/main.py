@@ -374,7 +374,10 @@ def crawl(args):
             tmp_fd, tmp_path = tempfile.mkstemp('.json')
             feed_uri = 'file://' + tmp_path
 
-        settings.update(FEED_URI=feed_uri, FEED_FORMAT='json')
+        settings.update(
+            FEED_URI=feed_uri,
+            FEED_FORMAT='json',
+            FEED_STORE_EMPTY=True)
 
     try:
         process = CrawlerProcess(settings=Settings(values=settings),
