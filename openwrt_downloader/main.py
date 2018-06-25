@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 class Image(Item):
     url = Field()
     version = Field()
+    build = Field()
     target = Field()
     device = Field()
     filesystem = Field()
@@ -45,16 +46,26 @@ class Image(Item):
     format = Field()
     sha256 = Field()
 
-    IMAGE_RE = (
-        r'(openwrt|lede)-(?P<version>.+?)-{target}-'
-        r'(?P<device>.+?)-(?P<filesystem>[^-]+)-(?P<type>[^-]+)\.'
-        r'(?P<format>bin|img)$')
+    PREFIX_RE = r'(?:openwrt|lede)'
+    VERSION_RE = r'(?P<version>(?:\d+\.?)+(?:-rc\d+)?)(?:-(?P<build>.+?))?'
+    DEVICE_RE = r'(?P<device>.+?)'
+    FILESYSTEM_RE = r'(?P<filesystem>[^-]+)'
+    IMAGE_TYPE_RE = r'(?P<type>[^-]+)'
+    FORMAT_RE = r'(?P<format>bin|img)'
+
+    @classmethod
+    def image_re(cls, target):
+        fmt = ('{prefix}-{version}-{target}-{device}-{filesystem}-'
+               '{type}\\.{format}')
+        target = re.escape(target.replace('/', '-'))
+        return fmt.format(prefix=cls.PREFIX_RE, version=cls.VERSION_RE,
+                          target=target, device=cls.DEVICE_RE,
+                          filesystem=cls.FILESYSTEM_RE, type=cls.IMAGE_TYPE_RE,
+                          format=cls.FORMAT_RE)
 
     @classmethod
     def from_url(cls, url, target):
-        url_target = re.escape(target.replace('/', '-'))
-        image_re = cls.IMAGE_RE.format(target=url_target)
-        image_match = re.search(image_re, url)
+        image_match = re.search(cls.image_re(target), url)
         if not image_match:
             return None
 
