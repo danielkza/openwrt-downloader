@@ -113,7 +113,7 @@ class OpenWrtSpider(Spider):
         if self.index_file:
             # Make a simple head request to the base URL, but ignore the result
             # and just generate the cached index images as a response.
-            yield Request(self.base_url, self.load_index)
+            yield Request(self.base_url, self.load_index, method='HEAD')
             return
 
         if self.version:
