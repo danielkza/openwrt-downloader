@@ -207,15 +207,18 @@ def sha256sum(buf):
     return m.hexdigest()
 
 
-class OpenWrtDownloaderPipeline(FilesPipeline):
-    def __init__(self, *args, **kwargs):
-        super(OpenWrtDownloaderPipeline, self).__init__(*args, **kwargs)
+class OpenWrtImageSelectorPipeline(object):
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(settings=crawler.settings, stats=crawler.stats)
 
-        settings = kwargs['settings']
+    def __init__(self, settings, stats):
         self.version = settings.get('OPENWRT_VERSION')
         self.device = settings.get('OPENWRT_DEVICE')
         self.target = settings.get('OPENWRT_TARGET')
         self.image_type = settings.get('OPENWRT_IMAGE_TYPE')
+
+        self.stats = stats
 
     def process_item(self, item, spider):
         if not isinstance(item, Image):
@@ -227,9 +230,11 @@ class OpenWrtDownloaderPipeline(FilesPipeline):
                 or self.image_type and item['type'] != self.image_type:
             raise DropItem("Rejected by OpenWRT filters")
 
-        process_item = super(OpenWrtDownloaderPipeline, self).process_item
-        return process_item(item, spider)
+        self.stats.inc_value('openwrt/images/processed')
+        return item
 
+
+class OpenWrtDownloaderPipeline(FilesPipeline):
     def get_media_requests(self, item, info):
         meta = {
             'sha256': item['sha256'],
@@ -270,6 +275,7 @@ class OpenWrtDownloaderPipeline(FilesPipeline):
         if self._check_media_fresh(response):
             logger.debug('Current copy is up-to-date, skipping download: %s',
                          request.url)
+            self.crawler.stats.inc_value('openwrt/images/skipped')
             return response.meta['media_stat']
 
         return None
@@ -330,8 +336,10 @@ class OpenWrtDownloaderPipeline(FilesPipeline):
     def item_completed(self, results, item, info):
         ok, result = results[0]
         if not ok:
+            self.crawler.stats.inc_value('openwrt/images/failed')
             raise DropItem("Download failed: {}".format(result))
 
+        self.crawler.stats.inc_value('openwrt/images/downloaded')
         return item
 
 
@@ -354,14 +362,17 @@ def crawl(args):
         OPENWRT_TARGET=args.target,
         OPENWRT_DEVICE=args.device,
         OPENWRT_IMAGE_TYPE=args.image_type,
-        LOG_FORMATTER=__name__ + '.PoliteLogFormatter'
+        LOG_FORMATTER=__name__ + '.PoliteLogFormatter',
+        ITEM_PIPELINES={__name__ + '.OpenWrtImageSelectorPipeline': 1},
     )
     tmp_fd = tmp_path = None
 
     if args.command == 'download':
+        settings['ITEM_PIPELINES'].update(
+            {__name__ + '.OpenWrtDownloaderPipeline': 2})
+
         settings.update(
             OPENWRT_INDEX_FILE=args.index_file,
-            ITEM_PIPELINES={__name__ + '.OpenWrtDownloaderPipeline': 1},
             FILES_STORE=os.path.abspath(args.download_dir),
             MEDIA_ALLOW_REDIRECTS=True)
     elif args.command == 'index':
@@ -384,11 +395,20 @@ def crawl(args):
                                  install_root_handler=False)
         logging.getLogger('scrapy').setLevel(logging.INFO)
         process.crawl(OpenWrtSpider)
+        stats = next(crawler for crawler in process.crawlers).stats
         process.start()
 
         if tmp_path:
             shutil.move(tmp_path, os.path.abspath(args.index_file))
             tmp_path = None
+
+        if stats.get_value('openwrt/images/processed') < 1:
+            return False
+        elif args.command == 'download' \
+                and stats.get_value('openwrt/images/failed') > 0:
+            return False
+
+        return True
     finally:
         if tmp_fd:
             os.close(tmp_fd)
@@ -445,7 +465,8 @@ def main():
     if args.command == 'index' and not args.index_file:
         argp.error('must specify --index-file with index command')
 
-    crawl(args)
+    if not crawl(args):
+        sys.exit(1)
 
 
 if __name__ == '__main__':
